@@ -8,6 +8,9 @@ import org.jenkinsci.test.acceptance.po.*;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.util.HashMap;
+import java.util.Map;
+
 @WithPlugins("log-parser")
 public class LogParserTest extends AbstractJUnitTest {
 
@@ -15,9 +18,7 @@ public class LogParserTest extends AbstractJUnitTest {
 
     @Before
     public void globalConfig() {
-        jenkins.configure();
         config = new LogParserGlobalConfig(jenkins.getConfigPage());
-        jenkins.save();
     }
 
     /**
@@ -25,6 +26,10 @@ public class LogParserTest extends AbstractJUnitTest {
      */
     @Test
     public void testing(){
+        Map<String, String> rules = new HashMap<>();
+        rules.put("des1", "path1");
+        rules.put("des2", "path2");
+        addLogParserRule(rules);
         FreeStyleJob j = jenkins.jobs.create(FreeStyleJob.class, "simple-job");
         j.configure();
         Resource res = resource("/warnings_plugin/warningsAll.txt");
@@ -61,6 +66,18 @@ public class LogParserTest extends AbstractJUnitTest {
     private void addLogParserRule(final String description, final String pathToFile){
         jenkins.configure();
         config.addParserConfig(description, pathToFile);
+        jenkins.save();
+    }
+
+    /**
+     * Adds serveral rules to the existing config.
+     * @param rules Map of the rules. Key is the description and Value is the path.
+     */
+    private void addLogParserRule(final Map<String, String> rules) {
+        jenkins.configure();
+        for(Map.Entry<String, String> rule : rules.entrySet()) {
+            config.addParserConfig(rule.getKey(), rule.getValue());
+        }
         jenkins.save();
     }
 }
