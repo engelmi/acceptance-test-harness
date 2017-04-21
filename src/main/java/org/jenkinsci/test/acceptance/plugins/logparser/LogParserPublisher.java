@@ -16,7 +16,7 @@ public class LogParserPublisher extends AbstractStep implements PostBuildStep {
         private final String projecttype;
         RuleType(String projecttype){
             this.projecttype = projecttype;
-        }
+        };
         public String getProjecttype(){
             return projecttype;
         }
@@ -31,6 +31,7 @@ public class LogParserPublisher extends AbstractStep implements PostBuildStep {
     /**
      * Constructor.
      * Should only be instantiated by addPublisher(...) of a job
+     *
      * @param parent
      * @param path
      */
@@ -45,6 +46,7 @@ public class LogParserPublisher extends AbstractStep implements PostBuildStep {
 
     /**
      * Sets the value of the checkbox for "mark on unstable warning".
+     *
      * @param state The boolean state of the checkbox
      */
     public void setMarkOnUnstableWarning(boolean state){
@@ -53,6 +55,7 @@ public class LogParserPublisher extends AbstractStep implements PostBuildStep {
 
     /**
      * Sets the value of the checkbox for "mark on build failed".
+     *
      * @param state The boolean state of the checkbox
      */
     public void setMarkOnBuildFail(boolean state){
@@ -61,6 +64,7 @@ public class LogParserPublisher extends AbstractStep implements PostBuildStep {
 
     /**
      * Sets the value of the checkbox for "show graph".
+     *
      * @param state The boolean state of the checkbox
      */
     public void setShowGraphs(boolean state){
@@ -69,6 +73,7 @@ public class LogParserPublisher extends AbstractStep implements PostBuildStep {
 
     /**
      * Sets the rule type and value for it.
+     *
      * @param type The type of the parsing-rule (see: {@link RuleType})
      * @param rule Whole path to the rule if the type is a {@link RuleType#PROJECT}. An already configured log-parser rule if the type is a {@link RuleType#GLOBAL}.
      */
