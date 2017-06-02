@@ -7,9 +7,11 @@ import javax.xml.parsers.ParserConfigurationException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.apache.commons.io.FilenameUtils;
@@ -22,30 +24,28 @@ import org.custommonkey.xmlunit.DifferenceListener;
 import org.custommonkey.xmlunit.XMLAssert;
 import org.custommonkey.xmlunit.XMLUnit;
 import org.jenkinsci.test.acceptance.junit.AbstractJUnitTest;
-import org.jenkinsci.test.acceptance.junit.Resource;
 import org.jenkinsci.test.acceptance.junit.Since;
 import org.jenkinsci.test.acceptance.junit.WithPlugins;
 import org.jenkinsci.test.acceptance.plugins.analysis_core.AnalysisAction;
 import org.jenkinsci.test.acceptance.plugins.analysis_core.AnalysisAction.Tab;
 import org.jenkinsci.test.acceptance.plugins.analysis_core.AnalysisConfigurator;
-import org.jenkinsci.test.acceptance.plugins.analysis_core.AnalysisMavenSettings;
 import org.jenkinsci.test.acceptance.plugins.analysis_core.AnalysisSettings;
 import org.jenkinsci.test.acceptance.plugins.analysis_core.GraphConfigurationView;
+import org.jenkinsci.test.acceptance.plugins.analysis_core.NullConfigurator;
 import org.jenkinsci.test.acceptance.plugins.dashboard_view.AbstractDashboardViewPortlet;
 import org.jenkinsci.test.acceptance.plugins.dashboard_view.DashboardView;
 import org.jenkinsci.test.acceptance.plugins.email_ext.EmailExtPublisher;
 import org.jenkinsci.test.acceptance.plugins.maven.MavenBuildStep;
 import org.jenkinsci.test.acceptance.plugins.maven.MavenInstallation;
 import org.jenkinsci.test.acceptance.plugins.maven.MavenModuleSet;
+import org.jenkinsci.test.acceptance.plugins.nested_view.NestedView;
 import org.jenkinsci.test.acceptance.po.Build;
 import org.jenkinsci.test.acceptance.po.Container;
 import org.jenkinsci.test.acceptance.po.Folder;
 import org.jenkinsci.test.acceptance.po.FreeStyleJob;
-import org.jenkinsci.test.acceptance.po.FreeStyleMultiBranchJob;
 import org.jenkinsci.test.acceptance.po.Job;
 import org.jenkinsci.test.acceptance.po.ListView;
 import org.jenkinsci.test.acceptance.po.ListViewColumn;
-import org.jenkinsci.test.acceptance.po.MatrixProject;
 import org.jenkinsci.test.acceptance.po.Node;
 import org.jenkinsci.test.acceptance.po.PostBuildStep;
 import org.jenkinsci.test.acceptance.po.Slave;
@@ -63,6 +63,7 @@ import org.xml.sax.SAXException;
 import com.google.inject.Inject;
 
 import static java.util.Collections.*;
+import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.*;
 import static org.hamcrest.MatcherAssert.*;
 import static org.jenkinsci.test.acceptance.Matchers.*;
@@ -85,6 +86,7 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
      * Checks that the plug-in sends a mail after a build has been failed. The content of the mail contains several
      * tokens that should be expanded in the mail with the correct values.
      */
+    // TODO: we should have two builds so that the numbers are different
     @Test @Issue("JENKINS-25501") @WithPlugins("email-ext")
     public void should_send_mail_with_expanded_tokens() {
         setUpMailer();
@@ -129,16 +131,23 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
     }
 
     /**
-     * Sets up a job within a folder. Verifies that the project action from the job redirects to the result
-     * of the last build. Checks the correct number of warnings in the project overview and
-     * result details view. Finally checks if the warnings-per-project portlet and warnings column show the
+     * Sets up a nested view that contains a dashboard view with a warnings-per-project portlet.
+     * Creates a folder in this view and a freestyle job in this folder.
+     * Finally checks if the warnings-per-project portlet and warnings column show the
      * correct number of warnings and provide a direct link to the actual warning results.
      */
-    @Test @Issue({"JENKINS-39947", "JENKINS-39950"}) @WithPlugins({"dashboard-view", "cloudbees-folder"})
+    @Test @Issue("JENKINS-39947") @WithPlugins({"dashboard-view", "nested-view", "cloudbees-folder", "analysis-core@1.87"})
     public void should_show_warnings_in_folder() {
-        Folder folder = jenkins.jobs.create(Folder.class, jenkins.createRandomName());
-        folder.save();
+        NestedView nested = jenkins.getViews().create(NestedView.class);
 
+        DashboardView dashboard = nested.getViews().create(DashboardView.class);
+        dashboard.configure(() -> {
+            dashboard.matchAllJobs();
+            dashboard.checkRecurseIntoFolders();
+        });
+
+        Folder folder = dashboard.jobs.create(Folder.class);
+        folder.save();
         folder.open();
 
         FreeStyleJob job = createFreeStyleJob(folder);
@@ -146,7 +155,10 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
 
         P projectAction = createProjectAction(job);
 
-        addDashboardViewAndBottomPortlet(projectAction.getTablePortlet(), folder);
+        dashboard.configure(() -> {
+            dashboard.addBottomPortlet(projectAction.getTablePortlet());
+        });
+
         verifyPortlet(projectAction);
 
         addListViewColumn(projectAction.getViewColumn(), folder);
@@ -371,7 +383,7 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
             final int numberOfWarnings) {
         elasticSleep(500);
 
-        Map<String, Integer> trend = job.getTrendGraphContent(action.getUrl());
+        Map<String, Integer> trend = getTrendGraphContent(action.getUrl());
         assertThat(trend.size(), is(6));
 
         List<String> actualUrls = new ArrayList<>();
@@ -389,6 +401,33 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
             }
             assertThat(sum, is(numberOfWarnings));
         }
+    }
+
+    /**
+     * Returns the relevant information of the trend graph image map. A trend graph shows for each build three
+     * values: the number of warnings for priority HIGH, NORMAL, and LOW. These results are returned in a map.
+     * The key is the URL to the warnings results of each build (and priority). The value is the number of warnings
+     * for each result.
+     *
+     * @param url the URL of the graph to look at
+     * @return the content of the trend graph
+     */
+    public Map<String, Integer> getTrendGraphContent(final String url) {
+        Map<String, Integer> links = new HashMap<String, Integer>();
+        Pattern resultLink = Pattern.compile("href=\"(.*" + url +".*)\"");
+        Pattern warningsCount = Pattern.compile("title=\"(\\d+).*\"");
+        for (WebElement area : all(by.xpath(".//div/map/area"))) {
+            String outerHtml = area.getAttribute("outerHTML");
+            Matcher linkMatcher = resultLink.matcher(outerHtml);
+            if (linkMatcher.find()) {
+                Matcher countMatcher = warningsCount.matcher(outerHtml);
+                if (countMatcher.find()) {
+                    links.put(linkMatcher.group(1), Integer.valueOf(countMatcher.group(1)));
+                }
+            }
+        }
+
+        return links;
     }
 
     /**
@@ -556,7 +595,6 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
      * @param body    body of the mail
      */
     protected void configureEmailNotification(final FreeStyleJob job, final String subject, final String body) {
-        // TODO: add a new job method that adds a publisher with configuration
         job.configure(() ->
             job.addPublisher(EmailExtPublisher.class, publisher -> {
                 publisher.subject.set(subject);
@@ -584,132 +622,100 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
     }
 
     /**
-     * Create a new freestyle job with a given resource and a publisher which can be configured by providing a
-     * configurator.
+     * Creates a new job of a certain type with a given resource and a publisher which can be configured by providing a
+     * configurator
      *
-     * @param resourceToCopy Resource to copy to build (Directory or File path)
-     * @param publisherClass the type of the publisher to be added
-     * @param owner          the owner of the job
+     * @param owner          the owner of the job (Jenkins or a folder)
+     * @param resourceToCopy Resource to copy to build (directory or file path)
+     * @param jobClass       the type the job shall be created of, e.g. FreeStyleJob
+     * @param settingsType   the type of the publisher to be added
      * @param configurator   the configuration of the publisher
      * @return the new job
      */
-    public <T extends AnalysisSettings & PostBuildStep> FreeStyleJob createFreestyleJob(
-            final String resourceToCopy, final Container owner, Class<T> publisherClass,
+    public <J extends Job, T extends AnalysisSettings & PostBuildStep> J createJob(
+            final Container owner, String resourceToCopy, Class<J> jobClass, Class<T> settingsType,
             AnalysisConfigurator<T> configurator) {
-        return setupJob(resourceToCopy, FreeStyleJob.class, publisherClass, null, owner, configurator);
-    }
-
-    /**
-     * Set up a Job of a certain type with a given resource and a publisher which can be configured by providing a
-     * configurator
-     *
-     * @param resourceToCopy              Resource to copy to build (Directory or File path)
-     * @param jobClass                    the type the job shall be created of, e.g. FreeStyleJob
-     * @param publisherBuildSettingsClass the type of the publisher to be added
-     * @param owner
-     * @param configurator                the configuration of the publisher
-     * @return the new job
-     */
-    public <J extends Job, T extends AnalysisSettings & PostBuildStep> J setupJob(String resourceToCopy,
-            Class<J> jobClass, Class<T> publisherBuildSettingsClass,
-            final Container owner, AnalysisConfigurator<T> configurator) {
-        return setupJob(resourceToCopy, jobClass, publisherBuildSettingsClass, null, owner, configurator);
-    }
-
-    /**
-     * Set up a Job of a certain type with a given resource and a publisher which can be configured by providing a
-     * configurator
-     *
-     * @param resourceToCopy              Resource to copy to build (Directory or File path)
-     * @param jobClass                    the type the job shall be created of, e.g. FreeStyleJob
-     * @param publisherBuildSettingsClass the type of the publisher to be added
-     * @param goal                        a maven goal to be added to the job or null otherwise
-     * @param owner                       the owner of the job (Jenkins or a folder)
-     * @param configurator                the configuration of the publisher
-     * @return the new job
-     */
-    public <J extends Job, T extends AnalysisSettings & PostBuildStep> J setupJob(String resourceToCopy,
-            Class<J> jobClass, Class<T> publisherBuildSettingsClass,
-            String goal, final Container owner, AnalysisConfigurator<T> configurator) {
-        if (jobClass.isAssignableFrom(MavenModuleSet.class)) {
-            MavenInstallation.ensureThatMavenIsInstalled(jenkins);
-        }
-
         J job = owner.getJobs().create(jobClass);
-        job.configure();
 
         if (resourceToCopy != null) {
-            // first copy resource and then add a goal
-            addResourceToJob(job, resourceToCopy);
+            job.copyResource(resourceToCopy);
         }
 
-        // check if a goal is defined and configure the job depending on the job class
-        if (goal != null) {
-            if (jobClass.isAssignableFrom(MavenModuleSet.class)) {
-                ((MavenModuleSet) job).goals.set(goal);
-            }
-            else if (isFreeStyleOrMatrixJob(jobClass)) {
-                job.addBuildStep(MavenBuildStep.class).targets.set(goal);
-            }
-        }
-
-        T buildSettings = null;
-
-        if (jobClass.isAssignableFrom(MavenModuleSet.class)) {
-            buildSettings = ((MavenModuleSet) job).addBuildSettings(publisherBuildSettingsClass);
-        }
-        else if (isFreeStyleOrMatrixJob(jobClass)) {
-            buildSettings = job.addPublisher(publisherBuildSettingsClass);
-        }
-
-        if ((buildSettings != null) && (configurator != null)) {
-            configurator.configure(buildSettings);
-        }
+        job.addPublisher(settingsType, configurator);
 
         job.save();
+
         return job;
     }
 
-    private <J extends Job> boolean isFreeStyleOrMatrixJob(final Class<J> jobClass) {
-        return jobClass.isAssignableFrom(FreeStyleJob.class)
-                || jobClass.isAssignableFrom(MatrixProject.class)
-                || jobClass.isAssignableFrom(FreeStyleMultiBranchJob.class);
+    /**
+     * Creates a new maven job (an instance of {@link MavenModuleSet}) and initializes it with the specified configurator.
+     *
+     * @param resources    File or folder in resources which will be copied to the working directory before the maven
+     *                     goals are invoked. Should contain the pom.xml.
+     * @param goal         The maven goals to set.
+     * @param settings     The code analyzer to use or null if you do not want one.
+     * @param configurator A configurator to customize the code analyzer settings you want to use.
+     * @param <T>          The type of the Analyzer.
+     * @return the configured job.
+     */
+    public <T extends AnalysisSettings> MavenModuleSet createMavenJob(
+            final String resources, final String goal, Class<T> settings, final AnalysisConfigurator<T> configurator) {
+        MavenInstallation.ensureThatMavenIsInstalled(jenkins);
+
+        MavenModuleSet job = jenkins.jobs.create(MavenModuleSet.class);
+
+        job.copyResource(resources);
+        job.setGoals(goal);
+        job.addBuildSettings(settings, configurator);
+
+        job.save();
+
+        return job;
+    }
+
+    public void setMavenGoal(final FreeStyleJob job, final String goal) {
+        MavenInstallation.ensureThatMavenIsInstalled(jenkins);
+        job.configure(() -> {
+            MavenBuildStep maven = job.addBuildStep(MavenBuildStep.class);
+            maven.setGoals(goal);
+            maven.useDefaultMavenVersion();
+        });
     }
 
     /**
      * Provides the ability to edit an existing job by changing or adding the resource to copy and/or by changing the
      * configuration of a publisher
      *
-     * @param newResourceToCopy    the new resource to be copied to build (Directory or File path) or null if not to be
+     * @param newResource          the new resource to be copied to build (Directory or File path) or null if not to be
      *                             changed
      * @param isAdditionalResource decides whether the old resource is kept (FALSE) or deleted (TRUE)
      * @param job                  the job to be changed
+     * @param settingsClass        the type of the publisher to be modified
      * @return the edited job
      */
-    public <J extends Job, T extends AnalysisSettings & PostBuildStep> J editJob(String newResourceToCopy,
-            boolean isAdditionalResource,
-            J job) {
-        return edit(newResourceToCopy, isAdditionalResource, job, null, null);
+    public <J extends Job, T extends AnalysisSettings & PostBuildStep> J editJob(
+            final String newResource, final boolean isAdditionalResource, final J job,
+            final Class<T> settingsClass) {
+        return edit(newResource, isAdditionalResource, job, settingsClass, new NullConfigurator<>());
     }
 
     /**
      * Provides the ability to edit an existing job by changing or adding the resource to copy and/or by changing the
      * configuration of a publisher
      *
-     * @param newResourceToCopy           the new resource to be copied to build (Directory or File path) or null if not
+     * @param newResource           the new resource to be copied to build (Directory or File path) or null if not
      *                                    to be changed
      * @param isAdditionalResource        decides whether the old resource is kept (FALSE) or deleted (TRUE)
      * @param job                         the job to be changed
-     * @param publisherBuildSettingsClass the type of the publisher to be modified
+     * @param settingClass the type of the publisher to be modified
      * @param configurator                the new configuration of the publisher
      * @return the edited job
      */
-    public <J extends Job, T extends AnalysisSettings & PostBuildStep> J editJob(String newResourceToCopy,
-            boolean isAdditionalResource,
-            J job,
-            Class<T> publisherBuildSettingsClass,
-            AnalysisConfigurator<T> configurator) {
-        return edit(newResourceToCopy, isAdditionalResource, job, publisherBuildSettingsClass, configurator);
+    public <J extends Job, T extends AnalysisSettings & PostBuildStep> J editJob(
+            final String newResource, final boolean isAdditionalResource, final J job,
+            final Class<T> settingClass, final AnalysisConfigurator<T> configurator) {
+        return edit(newResource, isAdditionalResource, job, settingClass, configurator);
     }
 
     /**
@@ -722,9 +728,7 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
      * @return the edited job
      */
     public <J extends Job, T extends AnalysisSettings & PostBuildStep> J editJob(
-            final J job,
-            Class<T> publisherBuildSettingsClass,
-            AnalysisConfigurator<T> configurator) {
+            final J job, final Class<T> publisherBuildSettingsClass, final AnalysisConfigurator<T> configurator) {
         return edit(null, false, job, publisherBuildSettingsClass, configurator);
     }
 
@@ -759,25 +763,21 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
      */
     private <J extends Job, T extends AnalysisSettings & PostBuildStep> J edit(
             @CheckForNull final String newResourceToCopy, final boolean isAdditionalResource,
-            final J job, final Class<T> publisherBuildSettingsClass, @CheckForNull AnalysisConfigurator<T> configurator) {
+            final J job, final Class<T> publisherBuildSettingsClass, final AnalysisConfigurator<T> configurator) {
         job.configure();
 
         if (newResourceToCopy != null) {
-            //check whether to exchange the copy resource shell step
             if (!isAdditionalResource) {
                 job.removeFirstBuildStep();
             }
 
-            //add the new copy resource shell step
-            addResourceToJob(job, newResourceToCopy);
+            job.copyResource(newResourceToCopy);
         }
 
-        // change the configuration of the publisher
-        if (configurator != null) {
-            configurator.configure(job.getPublisher(publisherBuildSettingsClass));
-        }
+        configurator.accept(job.getPublisher(publisherBuildSettingsClass));
 
         job.save();
+
         return job;
     }
 
@@ -797,7 +797,7 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
     }
 
     /**
-     * Creates a slave and configures thes specified job to run on that slave.
+     * Creates a slave and configures the specified job to run on that slave.
      *
      * @param job job to run on slave
      * @return created slave
@@ -813,37 +813,6 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
         catch (InterruptedException | ExecutionException e) {
             throw new RuntimeException("Can't create Slave", e);
         }
-    }
-
-    /**
-     * Setup a maven build.
-     *
-     * @param resourceProjectDir     A Folder in resources which shall be copied to the working directory. Should
-     *                               contain the pom.xml
-     * @param goal                   The maven goals to set.
-     * @param codeStyleBuildSettings The code analyzer to use or null if you do not want one.
-     * @param configurator           A configurator to customize the code analyzer settings you want to use.
-     * @param <T>                    The type of the Analyzer.
-     * @return The configured job.
-     */
-    public <T extends AnalysisMavenSettings> MavenModuleSet setupMavenJob(String resourceProjectDir,
-            String goal, Class<T> codeStyleBuildSettings, AnalysisConfigurator<T> configurator) {
-        MavenInstallation.ensureThatMavenIsInstalled(jenkins);
-
-        MavenModuleSet job = jenkins.jobs.create(MavenModuleSet.class);
-        job.copyDir(resource(resourceProjectDir));
-        job.goals.set(goal);
-
-
-        T buildSettings = job.addBuildSettings(codeStyleBuildSettings);
-
-        if (configurator != null) {
-            configurator.configure(buildSettings);
-        }
-
-        job.save();
-
-        return job;
     }
 
     /**
@@ -956,26 +925,6 @@ public abstract class AbstractAnalysisTest<P extends AnalysisAction> extends Abs
         view.configure();
         view.matchAllJobs();
         return view;
-    }
-
-    /**
-     * Adds a shell step to a given job to copy resources to the job's workspace.
-     *
-     * @param job            the job the resource shall be added to
-     * @param resourceToCopy Resource to copy to build (Directory or File path)
-     */
-    protected <J extends Job> J addResourceToJob(J job, String resourceToCopy) {
-
-        Resource res = resource(resourceToCopy);
-        //decide whether to utilize copyResource or copyDir
-        if (res.asFile().isDirectory()) {
-            job.copyDir(res);
-        }
-        else {
-            job.copyResource(res);
-        }
-
-        return job;
     }
 
     /**
